@@ -1,0 +1,26 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "mobility-exp"
+version = "0.1.0"
+description = "Unified IMF forecasting experiments"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "numpy>=1.24",
+    "pandas>=2.0",
+    "scikit-learn>=1.3",
+    "torch>=2.0",
+]
+
+[project.scripts]
+mobility-exp = "exp:main"
+
+[tool.setuptools]
+packages = ["models", "utils"]
+py-modules = ["exp", "config", "dataset", "trainer", "main"]
+
+[tool.uv]
+package = true

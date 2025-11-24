@@ -1,0 +1,2 @@
+[console_scripts]
+mobility-exp = exp:main

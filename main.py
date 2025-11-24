@@ -18,7 +18,7 @@ SEQ_LEN = 96
 PRED_LEN = 3
 BATCH = 128
 EPOCHS = 100
-SEED = 42
+SEED = 1337
 
 torch.manual_seed(SEED)
 torch.cuda.manual_seed_all(SEED)
@@ -83,30 +83,6 @@ def auto_group_imfs(imfs, n_groups=4):
         groups_sorted.append([])
 
     return groups_sorted[0], groups_sorted[1], groups_sorted[2], groups_sorted[3]
-
-
-def merge_trend_imfs(imfs, high_idx, mid_idx, seasonal_idx, trend_idx):
-    if len(trend_idx) <= 1:
-        return imfs, high_idx, mid_idx, seasonal_idx, trend_idx
-
-    trend_idx_sorted = sorted(trend_idx)
-    merged_trend = imfs[:, trend_idx_sorted].sum(axis=1, keepdims=True)
-
-    keep_cols = [i for i in range(imfs.shape[1]) if i not in trend_idx_sorted]
-    reduced = imfs[:, keep_cols]
-    merged_imfs = np.concatenate([reduced, merged_trend], axis=1)
-
-    index_map = {old: new for new, old in enumerate(keep_cols)}
-
-    def remap(idxs):
-        return [index_map[i] for i in idxs]
-
-    high_new = remap(high_idx)
-    mid_new = remap(mid_idx)
-    seasonal_new = remap(seasonal_idx)
-    trend_new = [merged_imfs.shape[1] - 1]
-
-    return merged_imfs, high_new, mid_new, seasonal_new, trend_new
 
 
 class IFDataset(Dataset):
@@ -228,9 +204,9 @@ class SeasonalTCN(nn.Module):
 
 
 class TrendLSTM(nn.Module):
-    def __init__(self, seq_len, pred_len, hidden=64):
+    def __init__(self, seq_len, pred_len, hidden=64, in_channels=1):
         super().__init__()
-        self.lstm = nn.LSTM(1, hidden, 2, batch_first=True, dropout=0.1)
+        self.lstm = nn.LSTM(in_channels, hidden, 2, batch_first=True, dropout=0.1)
         self.dec = nn.Linear(hidden, pred_len)
         self.ln = nn.LayerNorm(hidden)
 
@@ -257,12 +233,18 @@ class IFMultiModel(nn.Module):
         if imf_feats.ndim == 1:
             imf_feats = imf_feats[np.newaxis, :]
         self.register_buffer("imf_feats", torch.tensor(imf_feats, dtype=torch.float32))
-        gate_extra_dim = self.imf_feats.shape[1] if self.imf_feats.numel() > 0 else 0
+        self.imf_feat_dim = self.imf_feats.shape[1] if self.imf_feats.numel() > 0 else 0
+        gate_extra_dim = self.imf_feat_dim
+
+        if self.trend_idx:
+            self.register_buffer("trend_idx_tensor", torch.tensor(self.trend_idx, dtype=torch.long))
+        else:
+            self.trend_idx_tensor = None
 
         self.high_m = nn.ModuleList([TimesBlock(SEQ_LEN, PRED_LEN) for _ in high_idx])
         self.mid_m = nn.ModuleList([SeasonalTCN(SEQ_LEN, PRED_LEN) for _ in mid_idx])
         self.season_m = nn.ModuleList([SeasonalTCN(SEQ_LEN, PRED_LEN) for _ in seasonal_idx])
-        self.trend_m = nn.ModuleList([TrendLSTM(SEQ_LEN, PRED_LEN) for _ in trend_idx])
+        self.trend_m = TrendLSTM(SEQ_LEN, PRED_LEN, in_channels=len(trend_idx)) if trend_idx else None
 
         self.raw_m = RawEncoder()
 
@@ -287,19 +269,26 @@ class IFMultiModel(nn.Module):
 
     def forward(self, x_imf, x_raw, x_ex):
         preds = []
-        pred_indices = []
+        feat_list = [] if self.imf_feat_dim > 0 else None
         for i, idx in enumerate(self.high_idx):
             preds.append(self.high_m[i](x_imf[:, :, idx:idx+1]))
-            pred_indices.append(idx)
+            if feat_list is not None:
+                feat_list.append(self.imf_feats[idx])
         for i, idx in enumerate(self.mid_idx):
             preds.append(self.mid_m[i](x_imf[:, :, idx:idx+1]))
-            pred_indices.append(idx)
+            if feat_list is not None:
+                feat_list.append(self.imf_feats[idx])
         for i, idx in enumerate(self.season_idx):
             preds.append(self.season_m[i](x_imf[:, :, idx:idx+1]))
-            pred_indices.append(idx)
-        for i, idx in enumerate(self.trend_idx):
-            preds.append(self.trend_m[i](x_imf[:, :, idx:idx+1]))
-            pred_indices.append(idx)
+            if feat_list is not None:
+                feat_list.append(self.imf_feats[idx])
+
+        if self.trend_m is not None and self.trend_idx_tensor is not None:
+            trend_series = x_imf[:, :, self.trend_idx_tensor]
+            preds.append(self.trend_m(trend_series))
+            if feat_list is not None and self.trend_idx:
+                trend_feat = self.imf_feats.index_select(0, self.trend_idx_tensor).mean(dim=0)
+                feat_list.append(trend_feat)
 
         raw_pred = self.raw_m(x_raw, x_ex)
 
@@ -308,9 +297,8 @@ class IFMultiModel(nn.Module):
             gate_input = preds_stack.squeeze(-1)     # (B, n_imfs, L)
             B, N, L = gate_input.shape
 
-            if self.imf_feats.numel() > 0 and pred_indices:
-                idx_tensor = torch.tensor(pred_indices, device=gate_input.device, dtype=torch.long)
-                feats_sel = self.imf_feats.index_select(0, idx_tensor)
+            if feat_list:
+                feats_sel = torch.stack(feat_list, dim=0).to(gate_input.device)
                 feats_sel = feats_sel.unsqueeze(0).expand(B, -1, -1)
                 gate_feat = torch.cat([gate_input, feats_sel], dim=-1)
             else:
@@ -488,18 +476,10 @@ if __name__ == "__main__":
     test_raw  = full_raw[val_end:]
 
     train_imf = full_imf[:train_end]
-    high_idx, mid_idx, season_idx, trend_idx = auto_group_imfs(train_imf)
-
-    trend_before = len(trend_idx)
-    full_imf, high_idx, mid_idx, season_idx, trend_idx = merge_trend_imfs(
-        full_imf, high_idx, mid_idx, season_idx, trend_idx
-    )
-    if trend_before > 1 and len(trend_idx) == 1:
-        print(f"Trend IMFs merged: {trend_before} → 1")
-
-    train_imf = full_imf[:train_end]
     val_imf   = full_imf[train_end:val_end]
     test_imf  = full_imf[val_end:]
+
+    high_idx, mid_idx, season_idx, trend_idx = auto_group_imfs(train_imf)
 
     scaler_imf = StandardScaler()
     scaler_raw = StandardScaler()
