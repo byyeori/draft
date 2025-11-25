@@ -19,7 +19,10 @@ PRED_LEN = 3
 BATCH = 128
 EPOCHS = 100
 SEED = 1337
-ASSIGN_TEMP = 1.0
+ASSIGN_TEMP_START = 2.0
+ASSIGN_TEMP_END = 0.2
+ASSIGN_TEMP_WARMUP = 10
+ASSIGN_TEMP_DECAY = 40
 
 torch.manual_seed(SEED)
 torch.cuda.manual_seed_all(SEED)
@@ -84,6 +87,17 @@ def auto_group_imfs(imfs, n_groups=4):
         groups_sorted.append([])
 
     return groups_sorted[0], groups_sorted[1], groups_sorted[2], groups_sorted[3]
+
+
+def compute_assign_temp(epoch):
+    if ASSIGN_TEMP_START == ASSIGN_TEMP_END:
+        return ASSIGN_TEMP_START
+    if ASSIGN_TEMP_DECAY <= 0:
+        return ASSIGN_TEMP_END
+    if epoch < ASSIGN_TEMP_WARMUP:
+        return ASSIGN_TEMP_START
+    progress = min(max(epoch - ASSIGN_TEMP_WARMUP, 0) / ASSIGN_TEMP_DECAY, 1.0)
+    return ASSIGN_TEMP_START + (ASSIGN_TEMP_END - ASSIGN_TEMP_START) * progress
 
 
 class IFDataset(Dataset):
@@ -266,6 +280,9 @@ class IFMultiModel(nn.Module):
         self.align = nn.Linear(PRED_LEN, PRED_LEN)
 
         self.reset_parameters()
+
+    def set_assign_temp(self, value):
+        self.assign_temp = max(float(value), 1e-3)
 
 
     def forward(self, x_imf, x_raw, x_ex):
@@ -543,7 +560,7 @@ if __name__ == "__main__":
         trend_idx,
         scaler_raw,
         feats_gate,
-        assign_temp=ASSIGN_TEMP
+        assign_temp=ASSIGN_TEMP_START
     )
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -553,6 +570,10 @@ if __name__ == "__main__":
     patience = 20
     count = 0
     for epoch in range(EPOCHS):
+        if hasattr(model, "set_assign_temp"):
+            tau = compute_assign_temp(epoch)
+            model.set_assign_temp(tau)
+
         tr = trainer.train_epoch()
         val = trainer.validate()
         print(f"Epoch {epoch+1}/{EPOCHS} - Train MSE: {tr:.6f} | Val MSE: {val:.6f}")
@@ -572,6 +593,8 @@ if __name__ == "__main__":
     print("\n학습 완료!")
 
     model.load_state_dict(torch.load("best.pth", map_location=device))
+    if hasattr(model, "set_assign_temp"):
+        model.set_assign_temp(ASSIGN_TEMP_END)
 
     test_mse, test_mae, test_rmse = trainer.test(test_loader)
     print(f"[TEST] MSE={test_mse:.5f} | MAE={test_mae:.5f} | RMSE={test_rmse:.5f}")

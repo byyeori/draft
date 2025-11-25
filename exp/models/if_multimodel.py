@@ -239,6 +239,9 @@ class IFMultiModel(nn.Module):
 
         self.reset_parameters()
 
+    def set_assign_temp(self, value):
+        self.assign_temp = max(float(value), 1e-3)
+
     def _apply_branch(self, branch, series):
         B, L, N = series.shape
         flat = series.permute(0, 2, 1).reshape(B * N, L, 1)
@@ -357,3 +360,6 @@ class IFModel(BaseModel):
     def forward(self, x_imf, x_raw, x_ex):
         final, _, _ = self.inner(x_imf, x_raw, x_ex)
         return final
+
+    def set_assign_temp(self, value):
+        self.inner.set_assign_temp(value)
