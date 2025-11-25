@@ -67,7 +67,7 @@ def evaluate_on_test(model, loader, device, scaler_raw):
     return {"MSE": mse, "MAE": mae, "RMSE": rmse}
 
 
-def run_experiment(name, model_factory, train_loader, val_loader, test_loader, device, scaler_raw, assign_sched=None):
+def run_experiment(name, model_factory, train_loader, val_loader, test_loader, device, scaler_raw, assign_sched=None, patience=20, min_delta=0.0):
     print(f"\n===== Running {name} =====")
     model = model_factory().to(device)
     trainer = UnifiedTrainer(model, train_loader, val_loader, device, scaler_raw)
@@ -75,6 +75,7 @@ def run_experiment(name, model_factory, train_loader, val_loader, test_loader, d
     best = float('inf')
     ckpt_path = f"best_{name}.pth"
 
+    no_improve = 0
     for ep in range(EPOCHS):
         if assign_sched and hasattr(model, "set_assign_temp"):
             tau = compute_assign_temp(ep, assign_sched["start"], assign_sched["end"], assign_sched["warmup"], assign_sched["decay"])
@@ -85,9 +86,16 @@ def run_experiment(name, model_factory, train_loader, val_loader, test_loader, d
 
         trainer.scheduler.step(v)
 
-        if v < best:
+        if v < best - min_delta:
             best = v
             torch.save(model.state_dict(), ckpt_path)
+            no_improve = 0
+        else:
+            no_improve += 1
+
+        if no_improve >= patience:
+            print(f"[{name}] Early stopping at epoch {ep+1}")
+            break
 
     model.load_state_dict(torch.load(ckpt_path, map_location=device))
     if assign_sched and hasattr(model, "set_assign_temp"):
@@ -195,9 +203,22 @@ def main(argv=None):
         ("TFT", lambda: TFTModel(), None),
     ]
 
+    patience = 20
+    min_delta = 0.0
     results = {}
     for name, factory, sched in experiments:
-        val_loss, metrics = run_experiment(name, factory, train_loader, val_loader, test_loader, device, scaler_raw, sched if sched is not None else None)
+        val_loss, metrics = run_experiment(
+            name,
+            factory,
+            train_loader,
+            val_loader,
+            test_loader,
+            device,
+            scaler_raw,
+            assign_sched=sched if sched is not None else None,
+            patience=patience,
+            min_delta=min_delta
+        )
         results[name] = {"val": val_loss, **metrics}
 
     print("\n===== Final Comparison =====")

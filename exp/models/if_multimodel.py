@@ -228,13 +228,6 @@ class IFMultiModel(nn.Module):
                 if self.trend_idx:
                     self.trend_logits[self.trend_idx] = 1.0
 
-        self.alpha_gate = nn.Sequential(
-            nn.Linear(4, 32),
-            nn.ReLU(),
-            nn.Linear(32, 1),
-            nn.Sigmoid()
-        )
-
         self.align_high = nn.Linear(PRED_LEN, PRED_LEN)
         self.align_mid = nn.Linear(PRED_LEN, PRED_LEN)
         self.align_season = nn.Linear(PRED_LEN, PRED_LEN)
@@ -243,6 +236,14 @@ class IFMultiModel(nn.Module):
             nn.Linear(8, 64),
             nn.ReLU(),
             nn.Linear(64, 4)
+        )
+
+        self.alpha_context = nn.GRU(1, 32, batch_first=True)
+        self.alpha_gate = nn.Sequential(
+            nn.Linear(32 + 4, 32),
+            nn.ReLU(),
+            nn.Linear(32, 1),
+            nn.Sigmoid()
         )
 
         self.reset_parameters()
@@ -296,24 +297,17 @@ class IFMultiModel(nn.Module):
         trend_pred = (trend_all * weights["trend"].view(1, -1, 1, 1)).sum(dim=1)
 
         def align_group(pred, align_layer):
-            flat = pred.squeeze(-1)
+            mean = pred.mean(dim=1, keepdim=True)
+            std = pred.std(dim=1, keepdim=True) + 1e-6
+            norm = (pred - mean) / std
+            flat = norm.squeeze(-1)
             aligned = align_layer(flat).unsqueeze(-1)
-            return aligned
+            return aligned, mean.squeeze(-1), std.squeeze(-1)
 
-        high_aligned = align_group(high_pred, self.align_high)
-        mid_aligned = align_group(mid_pred, self.align_mid)
-        season_aligned = align_group(season_pred, self.align_season)
-        trend_aligned = align_group(trend_pred, self.align_trend)
-
-        def group_stats(tensor):
-            mean = tensor.mean(dim=1)
-            std = tensor.std(dim=1) + 1e-6
-            return mean, std
-
-        high_mean, high_std = group_stats(high_aligned)
-        mid_mean, mid_std = group_stats(mid_aligned)
-        season_mean, season_std = group_stats(season_aligned)
-        trend_mean, trend_std = group_stats(trend_aligned)
+        high_aligned, high_mean, high_std = align_group(high_pred, self.align_high)
+        mid_aligned, mid_mean, mid_std = align_group(mid_pred, self.align_mid)
+        season_aligned, season_mean, season_std = align_group(season_pred, self.align_season)
+        trend_aligned, trend_mean, trend_std = align_group(trend_pred, self.align_trend)
 
         gate_input = torch.cat([
             high_mean, high_std,
@@ -342,8 +336,11 @@ class IFMultiModel(nn.Module):
         raw_stats = torch.cat([raw_mean.squeeze(-1), raw_std.squeeze(-1)], dim=-1)
         imf_stats = torch.cat([imf_mean.squeeze(-1), imf_std.squeeze(-1)], dim=-1)
 
-        alpha_in = torch.cat([raw_stats, imf_stats], dim=-1)
-        alpha = self.alpha_gate(alpha_in).unsqueeze(-1)
+        ctx, _ = self.alpha_context(x_raw)
+        ctx_feat = ctx[:, -1]
+
+        alpha_in = torch.cat([raw_stats, imf_stats, ctx_feat], dim=-1)
+        alpha = self.alpha_gate(alpha_in).unsqueeze(-1) * 0.7
 
         final = alpha * raw_pred + (1 - alpha) * imf_aligned
 
