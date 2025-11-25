@@ -235,7 +235,15 @@ class IFMultiModel(nn.Module):
             nn.Sigmoid()
         )
 
-        self.align = nn.Linear(PRED_LEN, PRED_LEN)
+        self.align_high = nn.Linear(PRED_LEN, PRED_LEN)
+        self.align_mid = nn.Linear(PRED_LEN, PRED_LEN)
+        self.align_season = nn.Linear(PRED_LEN, PRED_LEN)
+        self.align_trend = nn.Linear(PRED_LEN, PRED_LEN)
+        self.group_gate = nn.Sequential(
+            nn.Linear(8, 64),
+            nn.ReLU(),
+            nn.Linear(64, 4)
+        )
 
         self.reset_parameters()
 
@@ -287,7 +295,37 @@ class IFMultiModel(nn.Module):
         season_pred = (season_all * weights["season"].view(1, -1, 1, 1)).sum(dim=1)
         trend_pred = (trend_all * weights["trend"].view(1, -1, 1, 1)).sum(dim=1)
 
-        imf_pred = high_pred + mid_pred + season_pred + trend_pred
+        def align_group(pred, align_layer):
+            flat = pred.squeeze(-1)
+            aligned = align_layer(flat).unsqueeze(-1)
+            return aligned
+
+        high_aligned = align_group(high_pred, self.align_high)
+        mid_aligned = align_group(mid_pred, self.align_mid)
+        season_aligned = align_group(season_pred, self.align_season)
+        trend_aligned = align_group(trend_pred, self.align_trend)
+
+        def group_stats(tensor):
+            mean = tensor.mean(dim=1)
+            std = tensor.std(dim=1) + 1e-6
+            return mean, std
+
+        high_mean, high_std = group_stats(high_aligned)
+        mid_mean, mid_std = group_stats(mid_aligned)
+        season_mean, season_std = group_stats(season_aligned)
+        trend_mean, trend_std = group_stats(trend_aligned)
+
+        gate_input = torch.cat([
+            high_mean, high_std,
+            mid_mean, mid_std,
+            season_mean, season_std,
+            trend_mean, trend_std
+        ], dim=-1)
+        group_logits = self.group_gate(gate_input)
+        B = gate_input.size(0)
+        group_weights = torch.softmax(group_logits, dim=-1).view(B, 4, 1, 1)
+        group_stack = torch.stack([high_aligned, mid_aligned, season_aligned, trend_aligned], dim=1)
+        imf_pred = (group_weights * group_stack).sum(dim=1)
 
         raw_pred = self.raw_m(x_raw, x_ex)
 
@@ -299,7 +337,7 @@ class IFMultiModel(nn.Module):
         imf_centered = imf_pred - imf_mean
         imf_scaled = imf_centered / imf_std
         imf_flat = imf_scaled.squeeze(-1)
-        imf_aligned = self.align(imf_flat).unsqueeze(-1)
+        imf_aligned = imf_flat.unsqueeze(-1)
 
         raw_stats = torch.cat([raw_mean.squeeze(-1), raw_std.squeeze(-1)], dim=-1)
         imf_stats = torch.cat([imf_mean.squeeze(-1), imf_std.squeeze(-1)], dim=-1)
