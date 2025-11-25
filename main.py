@@ -370,6 +370,21 @@ class Trainer:
             self.opt, mode='min', patience=5, factor=0.5
         )
 
+        scaler = getattr(model, "scaler_raw", None)
+        if scaler is not None and hasattr(scaler, "scale_") and hasattr(scaler, "mean_"):
+            scale = torch.tensor(scaler.scale_, dtype=torch.float32, device=self.device)
+            mean = torch.tensor(scaler.mean_, dtype=torch.float32, device=self.device)
+            self._scale = scale.view(1, 1, 1)
+            self._mean = mean.view(1, 1, 1)
+        else:
+            self._scale = None
+            self._mean = None
+
+    def _inverse_transform(self, tensor):
+        if self._scale is None or self._mean is None:
+            return tensor
+        return tensor * self._scale + self._mean
+
     def train_epoch(self):
         self.model.train()
         total = 0
@@ -410,7 +425,9 @@ class Trainer:
 
                 final, _, _ = self.model(x_imf, x_raw, x_ex)
 
-                loss = self.crit(final, y_raw)
+                final_denorm = self._inverse_transform(final)
+                target_denorm = self._inverse_transform(y_raw)
+                loss = self.crit(final_denorm, target_denorm)
                 total += loss.item()
 
         return total / len(self.val_loader)

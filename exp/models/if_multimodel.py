@@ -159,6 +159,7 @@ class IFMultiModel(nn.Module):
     def __init__(self, n_imfs, high_idx, mid_idx, seasonal_idx, trend_idx, scaler_raw=None, imf_feats=None):
         super().__init__()
         self.scaler_raw = scaler_raw
+        self.n_imfs = n_imfs
 
         self.high_idx = high_idx
         self.mid_idx = mid_idx
@@ -171,25 +172,50 @@ class IFMultiModel(nn.Module):
             imf_feats = imf_feats[np.newaxis, :]
         self.register_buffer("imf_feats", torch.tensor(imf_feats, dtype=torch.float32))
         self.imf_feat_dim = self.imf_feats.shape[1] if self.imf_feats.numel() > 0 else 0
-        gate_extra_dim = self.imf_feat_dim
 
-        if self.trend_idx:
-            self.register_buffer("trend_idx_tensor", torch.tensor(self.trend_idx, dtype=torch.long))
-        else:
-            self.trend_idx_tensor = None
-
-        self.high_m = nn.ModuleList([TimesBlock(SEQ_LEN, PRED_LEN) for _ in high_idx])
-        self.mid_m = nn.ModuleList([SeasonalTCN(SEQ_LEN, PRED_LEN) for _ in mid_idx])
-        self.season_m = nn.ModuleList([SeasonalTCN(SEQ_LEN, PRED_LEN) for _ in seasonal_idx])
-        self.trend_m = TrendLSTM(SEQ_LEN, PRED_LEN, in_channels=len(trend_idx)) if trend_idx else None
+        self.high_branch = TimesBlock(SEQ_LEN, PRED_LEN)
+        self.mid_branch = SeasonalTCN(SEQ_LEN, PRED_LEN)
+        self.season_branch = SeasonalTCN(SEQ_LEN, PRED_LEN)
+        self.trend_branch = TrendLSTM(SEQ_LEN, PRED_LEN, in_channels=1)
 
         self.raw_m = RawEncoder()
 
-        self.imf_gate = nn.Sequential(
-            nn.Linear(PRED_LEN + gate_extra_dim, 64),
-            nn.ReLU(),
-            nn.Linear(64, 1)
-        )
+        self.group_names = ["high", "mid", "season", "trend"]
+        if self.imf_feat_dim > 0:
+            self.high_assign = nn.Sequential(
+                nn.Linear(self.imf_feat_dim, 32),
+                nn.GELU(),
+                nn.Linear(32, 1)
+            )
+            self.mid_assign = nn.Sequential(
+                nn.Linear(self.imf_feat_dim, 32),
+                nn.GELU(),
+                nn.Linear(32, 1)
+            )
+            self.season_assign = nn.Sequential(
+                nn.Linear(self.imf_feat_dim, 32),
+                nn.GELU(),
+                nn.Linear(32, 1)
+            )
+            self.trend_assign = nn.Sequential(
+                nn.Linear(self.imf_feat_dim, 32),
+                nn.GELU(),
+                nn.Linear(32, 1)
+            )
+        else:
+            self.register_parameter("high_logits", nn.Parameter(torch.zeros(n_imfs, 1)))
+            self.register_parameter("mid_logits", nn.Parameter(torch.zeros(n_imfs, 1)))
+            self.register_parameter("season_logits", nn.Parameter(torch.zeros(n_imfs, 1)))
+            self.register_parameter("trend_logits", nn.Parameter(torch.zeros(n_imfs, 1)))
+            with torch.no_grad():
+                if self.high_idx:
+                    self.high_logits[self.high_idx] = 1.0
+                if self.mid_idx:
+                    self.mid_logits[self.mid_idx] = 1.0
+                if self.season_idx:
+                    self.season_logits[self.season_idx] = 1.0
+                if self.trend_idx:
+                    self.trend_logits[self.trend_idx] = 1.0
 
         self.alpha_gate = nn.Sequential(
             nn.Linear(4, 32),
@@ -202,50 +228,53 @@ class IFMultiModel(nn.Module):
 
         self.reset_parameters()
 
-    def forward(self, x_imf, x_raw, x_ex):
-        preds = []
-        feat_list = [] if self.imf_feat_dim > 0 else None
-        for i, idx in enumerate(self.high_idx):
-            preds.append(self.high_m[i](x_imf[:, :, idx:idx+1]))
-            if feat_list is not None:
-                feat_list.append(self.imf_feats[idx])
-        for i, idx in enumerate(self.mid_idx):
-            preds.append(self.mid_m[i](x_imf[:, :, idx:idx+1]))
-            if feat_list is not None:
-                feat_list.append(self.imf_feats[idx])
-        for i, idx in enumerate(self.season_idx):
-            preds.append(self.season_m[i](x_imf[:, :, idx:idx+1]))
-            if feat_list is not None:
-                feat_list.append(self.imf_feats[idx])
+    def _apply_branch(self, branch, series):
+        B, L, N = series.shape
+        flat = series.permute(0, 2, 1).reshape(B * N, L, 1)
+        out = branch(flat)
+        return out.view(B, N, PRED_LEN, 1)
 
-        if self.trend_m is not None and self.trend_idx_tensor is not None:
-            trend_series = x_imf[:, :, self.trend_idx_tensor]
-            preds.append(self.trend_m(trend_series))
-            if feat_list is not None and self.trend_idx:
-                trend_feat = self.imf_feats.index_select(0, self.trend_idx_tensor).mean(dim=0)
-                feat_list.append(trend_feat)
+    def _group_weights(self):
+        weights = {}
+        feats = self.imf_feats
+        if self.imf_feat_dim > 0 and feats.numel() > 0:
+            high_log = self.high_assign(feats).squeeze(-1)
+            mid_log = self.mid_assign(feats).squeeze(-1)
+            season_log = self.season_assign(feats).squeeze(-1)
+            trend_log = self.trend_assign(feats).squeeze(-1)
+        else:
+            high_log = self.high_logits.squeeze(-1)
+            mid_log = self.mid_logits.squeeze(-1)
+            season_log = self.season_logits.squeeze(-1)
+            trend_log = self.trend_logits.squeeze(-1)
+
+        weights["high"] = torch.softmax(high_log, dim=0)
+        weights["mid"] = torch.softmax(mid_log, dim=0)
+        weights["season"] = torch.softmax(season_log, dim=0)
+        weights["trend"] = torch.softmax(trend_log, dim=0)
+        return weights
+
+    def forward(self, x_imf, x_raw, x_ex):
+        if x_imf.size(-1) == 0:
+            raw_pred = self.raw_m(x_raw, x_ex)
+            imf_pred = torch.zeros_like(raw_pred)
+            return raw_pred, imf_pred, raw_pred
+
+        weights = self._group_weights()
+
+        high_all = self._apply_branch(self.high_branch, x_imf)
+        mid_all = self._apply_branch(self.mid_branch, x_imf)
+        season_all = self._apply_branch(self.season_branch, x_imf)
+        trend_all = self._apply_branch(self.trend_branch, x_imf)
+
+        high_pred = (high_all * weights["high"].view(1, -1, 1, 1)).sum(dim=1)
+        mid_pred = (mid_all * weights["mid"].view(1, -1, 1, 1)).sum(dim=1)
+        season_pred = (season_all * weights["season"].view(1, -1, 1, 1)).sum(dim=1)
+        trend_pred = (trend_all * weights["trend"].view(1, -1, 1, 1)).sum(dim=1)
+
+        imf_pred = high_pred + mid_pred + season_pred + trend_pred
 
         raw_pred = self.raw_m(x_raw, x_ex)
-
-        if preds:
-            preds_stack = torch.stack(preds, dim=1)
-            gate_input = preds_stack.squeeze(-1)
-            B, N, L = gate_input.shape
-
-            if feat_list:
-                feats_sel = torch.stack(feat_list, dim=0).to(gate_input.device)
-                feats_sel = feats_sel.unsqueeze(0).expand(B, -1, -1)
-                gate_feat = torch.cat([gate_input, feats_sel], dim=-1)
-            else:
-                gate_feat = gate_input
-
-            gate_scores = self.imf_gate(gate_feat.view(B * N, -1)).view(B, N, 1, 1)
-            weights = torch.softmax(gate_scores, dim=1)
-            imf_pred = (weights * preds_stack).sum(dim=1)
-        else:
-            imf_pred = torch.zeros_like(raw_pred)
-            final = raw_pred
-            return final, imf_pred, raw_pred
 
         raw_mean = raw_pred.mean(dim=1, keepdim=True)
         raw_std = raw_pred.std(dim=1, keepdim=True) + 1e-6

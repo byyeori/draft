@@ -59,7 +59,7 @@ def evaluate_on_test(model, loader, device, scaler_raw):
 def run_experiment(name, model_factory, train_loader, val_loader, test_loader, device, scaler_raw):
     print(f"\n===== Running {name} =====")
     model = model_factory().to(device)
-    trainer = UnifiedTrainer(model, train_loader, val_loader, device)
+    trainer = UnifiedTrainer(model, train_loader, val_loader, device, scaler_raw)
 
     best = float('inf')
     ckpt_path = f"best_{name}.pth"
