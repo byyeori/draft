@@ -19,6 +19,7 @@ PRED_LEN = 3
 BATCH = 128
 EPOCHS = 100
 SEED = 1337
+ASSIGN_TEMP = 1.0
 
 torch.manual_seed(SEED)
 torch.cuda.manual_seed_all(SEED)
@@ -534,7 +535,16 @@ if __name__ == "__main__":
         else:
             print(f"{name}: empty")
 
-    model = IFMultiModel(train_dataset.n_imfs, high_idx, mid_idx, season_idx, trend_idx, scaler_raw, feats_gate)
+    model = IFMultiModel(
+        train_dataset.n_imfs,
+        high_idx,
+        mid_idx,
+        season_idx,
+        trend_idx,
+        scaler_raw,
+        feats_gate,
+        assign_temp=ASSIGN_TEMP
+    )
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
     trainer = Trainer(model, train_loader, val_loader, device)

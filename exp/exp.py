@@ -90,6 +90,7 @@ def main(argv=None):
     parser.add_argument("--data-dir", type=str, default=str(default_data), help="Directory containing IFs_*.csv and timedata_*.csv")
     parser.add_argument("--imf-path", type=str, default=None, help="Override IMF CSV path")
     parser.add_argument("--raw-path", type=str, default=None, help="Override raw CSV path")
+    parser.add_argument("--if-assign-temp", type=float, default=1.0, help="Soft assignment temperature for IF model")
     args = parser.parse_args(argv)
 
     set_seed(SEED)
@@ -145,7 +146,8 @@ def main(argv=None):
             seasonal_idx=season_idx,
             trend_idx=trend_idx,
             scaler_raw=scaler_raw,
-            imf_feats=feats_gate
+            imf_feats=feats_gate,
+            assign_temp=args.if_assign_temp
         )
 
     experiments = [

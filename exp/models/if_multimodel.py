@@ -156,10 +156,21 @@ class TrendLSTM(nn.Module):
 
 
 class IFMultiModel(nn.Module):
-    def __init__(self, n_imfs, high_idx, mid_idx, seasonal_idx, trend_idx, scaler_raw=None, imf_feats=None):
+    def __init__(
+        self,
+        n_imfs,
+        high_idx,
+        mid_idx,
+        seasonal_idx,
+        trend_idx,
+        scaler_raw=None,
+        imf_feats=None,
+        assign_temp=1.0,
+    ):
         super().__init__()
         self.scaler_raw = scaler_raw
         self.n_imfs = n_imfs
+        self.assign_temp = max(assign_temp, 1e-3)
 
         self.high_idx = high_idx
         self.mid_idx = mid_idx
@@ -248,10 +259,11 @@ class IFMultiModel(nn.Module):
             season_log = self.season_logits.squeeze(-1)
             trend_log = self.trend_logits.squeeze(-1)
 
-        weights["high"] = torch.softmax(high_log, dim=0)
-        weights["mid"] = torch.softmax(mid_log, dim=0)
-        weights["season"] = torch.softmax(season_log, dim=0)
-        weights["trend"] = torch.softmax(trend_log, dim=0)
+        tau = self.assign_temp
+        weights["high"] = torch.softmax(high_log / tau, dim=0)
+        weights["mid"] = torch.softmax(mid_log / tau, dim=0)
+        weights["season"] = torch.softmax(season_log / tau, dim=0)
+        weights["trend"] = torch.softmax(trend_log / tau, dim=0)
         return weights
 
     def forward(self, x_imf, x_raw, x_ex):
@@ -319,7 +331,17 @@ class IFMultiModel(nn.Module):
 
 
 class IFModel(BaseModel):
-    def __init__(self, n_imfs, high_idx, mid_idx, seasonal_idx, trend_idx, scaler_raw=None, imf_feats=None):
+    def __init__(
+        self,
+        n_imfs,
+        high_idx,
+        mid_idx,
+        seasonal_idx,
+        trend_idx,
+        scaler_raw=None,
+        imf_feats=None,
+        assign_temp=1.0,
+    ):
         super().__init__()
         self.inner = IFMultiModel(
             n_imfs=n_imfs,
@@ -328,7 +350,8 @@ class IFModel(BaseModel):
             seasonal_idx=seasonal_idx,
             trend_idx=trend_idx,
             scaler_raw=scaler_raw,
-            imf_feats=imf_feats
+            imf_feats=imf_feats,
+            assign_temp=assign_temp,
         )
 
     def forward(self, x_imf, x_raw, x_ex):
